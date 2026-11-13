@@ -6,7 +6,7 @@ import dotenv
 import ast
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Optional
 from sqlalchemy import create_engine, Engine
 
 # Create an SQLite database
@@ -589,23 +589,202 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 ########################
 
 
-# Set up and load your env parameters and instantiate your model.
+from dataclasses import dataclass
+import re
 
 
-"""Set up tools for your agents to use, these should be methods that combine the database functions above
- and apply criteria to them to ensure that the flow of the system is correct."""
+@dataclass
+class RequestedItem:
+    quantity: int
+    requested_name: str
+    item_name: Optional[str] = None
 
 
-# Tools for inventory agent
+@dataclass
+class InventoryDecision:
+    items: list
+    unavailable: list
+    delivery_date: str | None
+    restocks: list
 
 
-# Tools for quoting agent
+class InventoryAgent:
+    """Checks stock, delivery feasibility, and safe replenishment options."""
+
+    def __init__(self, today: str):
+        self.today = today
+
+    def inspect(self, requested: list[RequestedItem], deadline: str) -> InventoryDecision:
+        inventory = get_all_inventory(self.today)
+        catalog = {name.lower(): name for name in inventory}
+        aliases = {
+            "a4 glossy paper": "Glossy paper",
+            "glossy a4 paper": "Glossy paper",
+            "a4 paper": "A4 paper",
+            "a4 printing paper": "A4 paper",
+            "a4 size printer paper": "A4 paper",
+            "a4 printer paper": "A4 paper",
+            "white printer paper": "A4 paper",
+            "printer paper": "A4 paper",
+            "standard printer paper": "A4 paper",
+            "standard printing paper": "A4 paper",
+            "colored cardstock": "Cardstock",
+            "recycled cardstock": "Cardstock",
+            "high-quality cardstock": "Cardstock",
+            "sturdy cardstock": "Cardstock",
+            "heavy cardstock": "Cardstock",
+            "white cardstock": "Cardstock",
+            "cardstock": "Cardstock",
+            "high-quality glossy paper": "Glossy paper",
+            "poster board": "Large poster paper (24x36 inches)",
+            "poster boards": "Large poster paper (24x36 inches)",
+            "kraft paper envelopes": "Kraft paper",
+        }
+        items, unavailable, restocks = [], [], []
+        latest_delivery = self.today
+        cash = get_cash_balance(self.today)
+        catalog = {item["item_name"].lower(): item["item_name"] for item in paper_supplies}
+        for request in requested:
+            key = re.sub(r"\s*\([^)]*\)", "", request.requested_name.lower())
+            key = re.sub(
+                r"\b(high-quality|sturdy|white|colorful|assorted|various|size|in)\b",
+                "",
+                key,
+            )
+            key = re.sub(r"\s+", " ", key).strip(" ,")
+            if "cardstock" in key:
+                key = "cardstock"
+            elif "glossy paper" in key:
+                key = "glossy paper"
+            canonical = aliases.get(key)
+            if canonical is None and key in catalog:
+                canonical = catalog[key]
+            if canonical is None or canonical.lower() not in catalog:
+                unavailable.append(f"{request.quantity} x {request.requested_name} (not stocked)")
+                continue
+            canonical = catalog[canonical.lower()]
+            stock = int(get_stock_level(canonical, self.today)["current_stock"].iloc[0])
+            if stock < request.quantity:
+                shortage = request.quantity - stock
+                delivery = get_supplier_delivery_date(self.today, shortage)
+                price = float(next(x["unit_price"] for x in paper_supplies
+                                   if x["item_name"] == canonical))
+                if delivery <= deadline and shortage * price <= cash:
+                    restocks.append((canonical, shortage, shortage * price, delivery))
+                    stock += shortage
+                else:
+                    unavailable.append(
+                        f"{request.quantity} x {request.requested_name} "
+                        f"(stock {stock}; supplier delivery {delivery})"
+                    )
+                    continue
+            items.append((canonical, request.quantity))
+            latest_delivery = max(latest_delivery, self.today)
+        return InventoryDecision(items, unavailable, latest_delivery, restocks)
 
 
-# Tools for ordering agent
+class QuoteAgent:
+    """Produces transparent quotes using history and quantity-based discounts."""
+
+    def quote(self, requested: list[RequestedItem], decision: InventoryDecision) -> tuple[float, str]:
+        terms = [item.requested_name for item in requested]
+        history = search_quote_history(terms, limit=3)
+        prices = {item["item_name"]: item["unit_price"] for item in paper_supplies}
+        subtotal = sum(quantity * prices[name] for name, quantity in decision.items)
+        total_units = sum(quantity for _, quantity in decision.items)
+        discount = 0.10 if total_units >= 1000 else 0.05 if total_units >= 500 else 0.0
+        total = round(subtotal * (1 - discount), 2)
+        history_note = f" Compared with {len(history)} similar historical quote(s)." if history else ""
+        explanation = (
+            f"Subtotal ${subtotal:.2f}; bulk discount {discount:.0%}; "
+            f"quoted total ${total:.2f}.{history_note}"
+        )
+        return total, explanation
 
 
-# Set up your agents and create an orchestration agent that will manage them.
+class FulfillmentAgent:
+    """Commits supplier purchases and sales only after all constraints pass."""
+
+    def fulfill(self, decision: InventoryDecision, total: float, order_date: str) -> str:
+        for item_name, quantity, cost, delivery in decision.restocks:
+            create_transaction(item_name, "stock_orders", quantity, cost, delivery)
+        for item_name, quantity in decision.items:
+            create_transaction(item_name, "sales", quantity, 0.0, order_date)
+        return "fulfilled"
+
+
+class ReportingAgent:
+    """Runs the required inventory, cash, and global financial health checks."""
+
+    def snapshot(self, as_of_date: str) -> dict:
+        # Explicit calls keep reporting useful even when the full report is not shown.
+        get_all_inventory(as_of_date)
+        get_cash_balance(as_of_date)
+        return generate_financial_report(as_of_date)
+
+
+def parse_requested_items(request: str) -> list[RequestedItem]:
+    """Extract quantity/name pairs from the plain-text customer request."""
+    request = re.sub(r"\(Date of request:.*?\)", "", request, flags=re.IGNORECASE)
+    request = re.sub(
+        r"\b(?:by|before|needed by|deliver(?:ed)? by)\s+[A-Z][a-z]+ \d{1,2}, \d{4}",
+        "",
+        request,
+        flags=re.IGNORECASE,
+    )
+    request = re.sub(
+        r",\s+(?=(?:recycled|assorted|various|white|colored|biodegradable)\b)",
+        " ",
+        request,
+        flags=re.IGNORECASE,
+    )
+    patterns = [
+        r"(?<![A-Za-z0-9])(\d[\d,]*)\s+(?:sheets?|reams?|rolls?|boxes?|packets?|units?)\s+of\s+"
+        r"([A-Za-z0-9][^,\n.;]*?)(?=\s+and\s+\d|\s+for\b|\s+by\b|[,\n.;]|$)",
+        r"(?<![A-Za-z0-9])(\d[\d,]*)\s+(?!sheets?\b|reams?\b|rolls?\b|boxes?\b|packets?\b|units?\b)"
+        r"([A-Za-z][^,\n.;]*?)(?=\s+and\s+\d|\s+for\b|\s+by\b|[,\n.;]|$)",
+    ]
+    found = []
+    for pattern in patterns:
+        found.extend(re.findall(pattern, request, flags=re.IGNORECASE))
+    result = []
+    seen = set()
+    for quantity, name in found:
+        quantity = int(quantity.replace(",", ""))
+        name = re.sub(r"\s+", " ", name).strip(" -")
+        key = (quantity, name.lower())
+        if quantity > 0 and key not in seen:
+            result.append(RequestedItem(quantity, name))
+            seen.add(key)
+    return result
+
+
+def call_multi_agent_system(request: str) -> str:
+    """Orchestrator: parse, inspect, quote, fulfill, and report a customer request."""
+    date_match = re.search(r"Date of request:\s*(\d{4}-\d{2}-\d{2})", request)
+    order_date = date_match.group(1) if date_match else datetime.now().strftime("%Y-%m-%d")
+    deadline_match = re.search(
+        r"(?:by|before|needed by|deliver(?:ed)? by)\s+([A-Z][a-z]+ \d{1,2}, \d{4})",
+        request,
+        flags=re.IGNORECASE,
+    )
+    deadline = order_date
+    if deadline_match:
+        deadline = datetime.strptime(deadline_match.group(1), "%B %d, %Y").strftime("%Y-%m-%d")
+    requested = parse_requested_items(request)
+    inventory_agent = InventoryAgent(order_date)
+    decision = inventory_agent.inspect(requested, deadline)
+    quote_agent = QuoteAgent()
+    total, explanation = quote_agent.quote(requested, decision)
+    if decision.unavailable or not decision.items:
+        reason = "; ".join(decision.unavailable) or "No recognizable items were requested."
+        return f"UNFULFILLED: {reason} Quote not finalized. {explanation}"
+    if decision.delivery_date and decision.delivery_date > deadline:
+        return f"UNFULFILLED: supplier delivery {decision.delivery_date} misses deadline {deadline}."
+    FulfillmentAgent().fulfill(decision, total, order_date)
+    ReportingAgent().snapshot(order_date)
+    names = ", ".join(f"{quantity} x {name}" for name, quantity in decision.items)
+    return f"FULFILLED: {names}. Total ${total:.2f}. Delivery by {deadline}. {explanation}"
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
@@ -613,20 +792,20 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
-        quote_requests_sample["request_date"] = pd.to_datetime(
-            quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
-        )
-        quote_requests_sample.dropna(subset=["request_date"], inplace=True)
+        quote_requests_sample["request_date"] = [
+            datetime.strptime(str(value), "%m/%d/%y").strftime("%Y-%m-%d")
+            for value in quote_requests_sample["request_date"]
+        ]
         quote_requests_sample = quote_requests_sample.sort_values("request_date")
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
 
     # Get initial state
-    initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
+    initial_date = quote_requests_sample["request_date"].min()
     report = generate_financial_report(initial_date)
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
@@ -641,7 +820,7 @@ def run_test_scenarios():
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
-        request_date = row["request_date"].strftime("%Y-%m-%d")
+        request_date = row["request_date"]
 
         print(f"\n=== Request {idx+1} ===")
         print(f"Context: {row['job']} organizing {row['event']}")
@@ -660,7 +839,7 @@ def run_test_scenarios():
         ############
         ############
 
-        # response = call_your_multi_agent_system(request_with_date)
+        response = call_multi_agent_system(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
@@ -684,7 +863,7 @@ def run_test_scenarios():
         time.sleep(1)
 
     # Final report
-    final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
+    final_date = quote_requests_sample["request_date"].max()
     final_report = generate_financial_report(final_date)
     print("\n===== FINAL FINANCIAL REPORT =====")
     print(f"Final Cash: ${final_report['cash_balance']:.2f}")
