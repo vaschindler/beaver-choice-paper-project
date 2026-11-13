@@ -9,18 +9,16 @@ stock and supplier lead time, and can authorize a shortage purchase only when th
 deadline and cash balance permit it. Quote uses historical quote search and applies
 5% or 10% bulk discounts. Fulfillment is the only agent that writes sales or
 stock-order transactions. Reporting invokes inventory, cash, and financial-report
-helpers after each processed request.
-
-The system uses explicit text handoffs instead of requiring an API key or an
-external model, so the supplied evaluation script is reproducible offline.
+helpers after each processed request. The system uses explicit text handoffs and
+does not require a live model call, so the supplied evaluation script is
+reproducible offline.
 
 ## Framework decision
 
-I selected a lightweight Python orchestration layer for this offline evaluation
-instead of `smolagents`, `pydantic-ai`, or `npcsh`. The agent boundaries and text
-handoffs are explicit Python classes, which avoids making the required test run
-dependent on an API key or network service while preserving the same delegation
-model those frameworks would provide.
+I selected `smolagents` because its `@tool` decorator gives each worker a clear,
+inspectable tool boundary without requiring a live model for deterministic
+evaluation. The five Python agent classes perform orchestration explicitly, while
+the decorated tools delegate to the supplied database helpers.
 
 ## Starter helper review
 
@@ -40,10 +38,17 @@ model those frameworks would provide.
 
 Running `python project_starter.py` initializes the database, processes
 `quote_requests_sample.csv` chronologically, and writes `test_results.csv`.
-The seeded data produces multiple fulfilled small orders and multiple explicit
-`UNFULFILLED` responses for missing catalog items, insufficient stock, or
-impossible deadlines. Each rejection includes a reason, while successful
-responses include the item list, discount-aware total, and delivery date.
+The evaluation processes all 20 requests. The seeded data produces at least five
+fulfilled orders and multiple explicit `UNFULFILLED` responses for missing
+catalog items, insufficient stock, or impossible deadlines. Successful orders
+record sales revenue, so the cash balance changes for more than three requests.
+Each rejection includes a reason, while successful responses include the item
+list, discount-aware total, and delivery date. Supplier purchases are dated on
+their estimated arrival and customer sales are dated on the resulting
+fulfillment date, preventing sales before replenishment arrives. Inventory checks
+also project through each promised deadline, including already committed
+arrivals and sales, preventing multiple orders from reserving the same future
+stock.
 
 ## Improvements
 

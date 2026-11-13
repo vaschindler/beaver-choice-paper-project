@@ -592,6 +592,13 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 from dataclasses import dataclass
 import re
 
+try:
+    from smolagents import tool
+except ImportError:
+    # Keeps the deterministic evaluator runnable before optional dependencies install.
+    def tool(function):
+        return function
+
 
 @dataclass
 class RequestedItem:
@@ -608,6 +615,89 @@ class InventoryDecision:
     restocks: list
 
 
+@tool
+def inventory_snapshot_tool(as_of_date: str) -> Dict[str, int]:
+    """Return positive inventory by item using the starter inventory helper.
+
+    Args:
+        as_of_date: Inclusive ISO date for the inventory snapshot.
+    """
+    return get_all_inventory(as_of_date)
+
+
+@tool
+def item_stock_tool(item_name: str, as_of_date: str) -> int:
+    """Return one item's stock using the starter stock-level helper.
+
+    Args:
+        item_name: Exact catalog item name.
+        as_of_date: Inclusive ISO date for the stock lookup.
+    """
+    return int(get_stock_level(item_name, as_of_date)["current_stock"].iloc[0])
+
+
+@tool
+def supplier_delivery_tool(input_date: str, quantity: int) -> str:
+    """Estimate supplier delivery using the starter delivery-date helper.
+
+    Args:
+        input_date: ISO date on which the supplier order is placed.
+        quantity: Number of units ordered.
+    """
+    return get_supplier_delivery_date(input_date, quantity)
+
+
+@tool
+def cash_balance_tool(as_of_date: str) -> float:
+    """Return cash available using the starter cash-balance helper.
+
+    Args:
+        as_of_date: Inclusive ISO date for the cash calculation.
+    """
+    return get_cash_balance(as_of_date)
+
+
+@tool
+def financial_report_tool(as_of_date: str) -> Dict:
+    """Return the global financial report using the starter report helper.
+
+    Args:
+        as_of_date: Inclusive ISO date for the report.
+    """
+    return generate_financial_report(as_of_date)
+
+
+@tool
+def quote_history_tool(search_terms: List[str], limit: int = 5) -> List[Dict]:
+    """Find comparable quotes using the starter quote-history helper.
+
+    Args:
+        search_terms: Customer terms to match in prior requests and explanations.
+        limit: Maximum number of historical quotes to return.
+    """
+    return search_quote_history(search_terms, limit)
+
+
+@tool
+def transaction_tool(
+    item_name: str,
+    transaction_type: str,
+    quantity: int,
+    price: float,
+    date: str,
+) -> int:
+    """Record a sale or supplier purchase using the starter transaction helper.
+
+    Args:
+        item_name: Exact catalog item name.
+        transaction_type: Either ``sales`` or ``stock_orders``.
+        quantity: Number of units in the transaction.
+        price: Total transaction price.
+        date: ISO date of the transaction.
+    """
+    return create_transaction(item_name, transaction_type, quantity, price, date)
+
+
 class InventoryAgent:
     """Checks stock, delivery feasibility, and safe replenishment options."""
 
@@ -615,7 +705,7 @@ class InventoryAgent:
         self.today = today
 
     def inspect(self, requested: list[RequestedItem], deadline: str) -> InventoryDecision:
-        inventory = get_all_inventory(self.today)
+        inventory = inventory_snapshot_tool(deadline)
         catalog = {name.lower(): name for name in inventory}
         aliases = {
             "a4 glossy paper": "Glossy paper",
@@ -642,7 +732,7 @@ class InventoryAgent:
         }
         items, unavailable, restocks = [], [], []
         latest_delivery = self.today
-        cash = get_cash_balance(self.today)
+        cash = cash_balance_tool(self.today)
         catalog = {item["item_name"].lower(): item["item_name"] for item in paper_supplies}
         for request in requested:
             key = re.sub(r"\s*\([^)]*\)", "", request.requested_name.lower())
@@ -663,10 +753,12 @@ class InventoryAgent:
                 unavailable.append(f"{request.quantity} x {request.requested_name} (not stocked)")
                 continue
             canonical = catalog[canonical.lower()]
-            stock = int(get_stock_level(canonical, self.today)["current_stock"].iloc[0])
+            # Include already committed arrivals and sales through the promised
+            # date so multiple orders cannot reserve the same future stock.
+            stock = item_stock_tool(canonical, deadline)
             if stock < request.quantity:
                 shortage = request.quantity - stock
-                delivery = get_supplier_delivery_date(self.today, shortage)
+                delivery = supplier_delivery_tool(self.today, shortage)
                 price = float(next(x["unit_price"] for x in paper_supplies
                                    if x["item_name"] == canonical))
                 if delivery <= deadline and shortage * price <= cash:
@@ -688,7 +780,7 @@ class QuoteAgent:
 
     def quote(self, requested: list[RequestedItem], decision: InventoryDecision) -> tuple[float, str]:
         terms = [item.requested_name for item in requested]
-        history = search_quote_history(terms, limit=3)
+        history = quote_history_tool(terms, limit=3)
         prices = {item["item_name"]: item["unit_price"] for item in paper_supplies}
         subtotal = sum(quantity * prices[name] for name, quantity in decision.items)
         total_units = sum(quantity for _, quantity in decision.items)
@@ -706,10 +798,36 @@ class FulfillmentAgent:
     """Commits supplier purchases and sales only after all constraints pass."""
 
     def fulfill(self, decision: InventoryDecision, total: float, order_date: str) -> str:
+        fulfillment_date = max(
+            [delivery for _, _, _, delivery in decision.restocks] or [order_date]
+        )
         for item_name, quantity, cost, delivery in decision.restocks:
-            create_transaction(item_name, "stock_orders", quantity, cost, delivery)
-        for item_name, quantity in decision.items:
-            create_transaction(item_name, "sales", quantity, 0.0, order_date)
+            transaction_tool(item_name, "stock_orders", quantity, cost, delivery)
+        subtotal = sum(
+            quantity * next(item["unit_price"] for item in paper_supplies
+                            if item["item_name"] == item_name)
+            for item_name, quantity in decision.items
+        )
+        line_revenues = [
+            round(
+                total
+                * (
+                    quantity
+                    * next(item["unit_price"] for item in paper_supplies
+                           if item["item_name"] == item_name)
+                )
+                / subtotal,
+                2,
+            )
+            for item_name, quantity in decision.items
+        ]
+        line_revenues[-1] = round(total - sum(line_revenues[:-1]), 2)
+        for (item_name, quantity), line_revenue in zip(
+            decision.items, line_revenues
+        ):
+            transaction_tool(
+                item_name, "sales", quantity, line_revenue, fulfillment_date
+            )
         return "fulfilled"
 
 
@@ -717,10 +835,7 @@ class ReportingAgent:
     """Runs the required inventory, cash, and global financial health checks."""
 
     def snapshot(self, as_of_date: str) -> dict:
-        # Explicit calls keep reporting useful even when the full report is not shown.
-        get_all_inventory(as_of_date)
-        get_cash_balance(as_of_date)
-        return generate_financial_report(as_of_date)
+        return financial_report_tool(as_of_date)
 
 
 def parse_requested_items(request: str) -> list[RequestedItem]:
